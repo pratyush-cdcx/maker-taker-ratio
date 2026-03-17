@@ -26,6 +26,8 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class KafkaBenchmark {
@@ -64,7 +66,7 @@ public final class KafkaBenchmark {
 
         System.out.println("Kafka [" + mode + "]: warming up with " + WARMUP_COUNT + " messages...");
         for (int i = 0; i < WARMUP_COUNT; i++) {
-            encodeTrade(sendBuffer, headerEncoder, tradeEncoder, i, System.currentTimeMillis());
+            encodeTrade(sendBuffer, headerEncoder, tradeEncoder, i, System.nanoTime());
             int len = MessageHeaderEncoder.ENCODED_LENGTH + tradeEncoder.encodedLength();
             byte[] value = new byte[len];
             sendBuffer.getBytes(0, value);
@@ -82,12 +84,35 @@ public final class KafkaBenchmark {
 
         System.out.println("Kafka [" + mode + "]: measuring " + messageCount + " messages...");
         Histogram histogram = new Histogram(10_000_000_000L, 3);
-        AtomicLong received = new AtomicLong(0);
         int expectedResponses = messageCount * RESPONSES_PER_TRADE;
+        CountDownLatch latch = new CountDownLatch(expectedResponses);
+        AtomicLong received = new AtomicLong(0);
 
-        MessageHeaderDecoder hdrDec = new MessageHeaderDecoder();
-        RatioUpdateDecoder ratioDec = new RatioUpdateDecoder();
-        UnsafeBuffer decodeBuffer = new UnsafeBuffer(new byte[0]);
+        Thread resultThread = new Thread(() -> {
+            MessageHeaderDecoder hdrDec = new MessageHeaderDecoder();
+            RatioUpdateDecoder ratioDec = new RatioUpdateDecoder();
+            UnsafeBuffer decodeBuffer = new UnsafeBuffer(new byte[0]);
+
+            while (received.get() < expectedResponses) {
+                ConsumerRecords<byte[], byte[]> records = resultConsumer.poll(Duration.ofMillis(10));
+                records.forEach(record -> {
+                    long receiveTime = System.nanoTime();
+                    decodeBuffer.wrap(record.value());
+                    hdrDec.wrap(decodeBuffer, 0);
+                    ratioDec.wrap(decodeBuffer, MessageHeaderDecoder.ENCODED_LENGTH,
+                        hdrDec.blockLength(), hdrDec.version());
+                    long sendTimeRead = ratioDec.timestamp();
+                    long latency = receiveTime - sendTimeRead;
+                    if (latency > 0) {
+                        histogram.recordValue(latency);
+                    }
+                    received.incrementAndGet();
+                    latch.countDown();
+                });
+            }
+        }, "bench-kafka-result");
+        resultThread.setDaemon(true);
+        resultThread.start();
 
         long intervalNanos = targetRps > 0 ? 1_000_000_000L / targetRps : 0;
 
@@ -114,25 +139,13 @@ public final class KafkaBenchmark {
         }
         benchProducer.flush();
 
-        long deadline = System.currentTimeMillis() + 30_000;
-        while (received.get() < expectedResponses && System.currentTimeMillis() < deadline) {
-            ConsumerRecords<byte[], byte[]> records = resultConsumer.poll(Duration.ofMillis(50));
-            records.forEach(record -> {
-                long receiveTime = System.nanoTime();
-                decodeBuffer.wrap(record.value());
-                hdrDec.wrap(decodeBuffer, 0);
-                ratioDec.wrap(decodeBuffer, MessageHeaderDecoder.ENCODED_LENGTH,
-                    hdrDec.blockLength(), hdrDec.version());
-                long sendTimeRead = ratioDec.timestamp();
-                long latency = receiveTime - sendTimeRead;
-                if (latency > 0) {
-                    histogram.recordValue(latency);
-                }
-                received.incrementAndGet();
-            });
-        }
-
+        boolean completed = latch.await(60, TimeUnit.SECONDS);
         long elapsedNanos = System.nanoTime() - startNanos;
+
+        if (!completed) {
+            System.out.println("Warning: not all responses received. Got " +
+                received.get() + "/" + expectedResponses);
+        }
 
         tradeConsumer.close();
         ratioProducer.close();
@@ -162,7 +175,7 @@ public final class KafkaBenchmark {
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
         props.put(ProducerConfig.ACKS_CONFIG, "1");
-        props.put(ProducerConfig.LINGER_MS_CONFIG, "1");
+        props.put(ProducerConfig.LINGER_MS_CONFIG, "0");
         props.put(ProducerConfig.BATCH_SIZE_CONFIG, "16384");
         return new KafkaProducer<>(props);
     }
@@ -175,6 +188,8 @@ public final class KafkaBenchmark {
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "true");
+        props.put(ConsumerConfig.FETCH_MIN_BYTES_CONFIG, "1");
+        props.put(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG, "10");
         KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(props);
         consumer.subscribe(Collections.singletonList(topic));
         consumer.poll(Duration.ofMillis(100));
