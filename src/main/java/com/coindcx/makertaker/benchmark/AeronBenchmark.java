@@ -187,15 +187,24 @@ public final class AeronBenchmark {
         System.out.println(burstResult);
         System.out.println();
 
-        int pacedRps = targetRps > 0 ? targetRps : 25_000;
-        int pacedCount = Math.min(count, pacedRps * 10);
-        System.out.println("=== Aeron IPC Benchmark: Paced @ " + pacedRps + " RPS ===");
-        BenchmarkResult pacedResult = run(pacedCount, pacedRps);
-        System.out.println(pacedResult);
-        System.out.println();
+        int[] rpsLevels = targetRps > 0
+            ? new int[]{targetRps}
+            : new int[]{25_000, 50_000, 100_000};
+
+        BenchmarkResult[] pacedResults = new BenchmarkResult[rpsLevels.length];
+        for (int r = 0; r < rpsLevels.length; r++) {
+            int rps = rpsLevels[r];
+            int pacedCount = Math.min(count, rps * 5);
+            System.out.println("=== Aeron IPC Benchmark: Paced @ " + rps + " RPS ===");
+            pacedResults[r] = run(pacedCount, rps);
+            System.out.println(pacedResults[r]);
+            System.out.println();
+        }
 
         System.out.println("=== Comparison ===");
         System.out.println(burstResult);
-        System.out.println(pacedResult);
+        for (BenchmarkResult pr : pacedResults) {
+            System.out.println(pr);
+        }
     }
 }
